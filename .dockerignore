@@ -1,0 +1,10 @@
+node_modules
+data
+infra
+build
+.git
+.env
+*.ovpn
+.tools
+docs
+test
