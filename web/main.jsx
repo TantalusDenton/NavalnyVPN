@@ -1004,9 +1004,11 @@ function App() {
                 <h3>Import. Connect. Explore.</h3>
                 <p>
                   Import the .ovpn file into your client, enable IPv6 leak
-                  protection and the kill switch, then connect. Import the
-                  profile into a compatible router to protect devices on your
-                  home network.
+                  protection and the kill switch, then connect. The profile
+                  tries UDP first and automatically falls back to TCP on port
+                  443 if UDP is unreachable; TCP can be slower on congested
+                  networks. Import it into a compatible router to protect
+                  devices on your home network.
                 </p>
               </div>
             </li>
@@ -1016,8 +1018,10 @@ function App() {
             <p>
               Pi-hole filters domains, so it cannot block every in-app ad or
               guarantee adult-content blocking. Disable browser secure DNS if
-              you want all DNS requests filtered. OpenVPN is not traffic
-              obfuscation and may be blocked on restrictive networks.
+              you want all DNS requests filtered. The TCP/443 fallback and
+              tls-crypt make OpenVPN harder to identify and can help on
+              restrictive networks, but this does not impersonate HTTPS or
+              guarantee that traffic cannot be recognized or blocked.
             </p>
           </div>
           <button

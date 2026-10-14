@@ -31,7 +31,7 @@ resource "aws_route_table_association" "public" {
 resource "aws_security_group" "vpn" {
   name_prefix = "${var.project}-vpn-"
   vpc_id      = aws_vpc.vpn.id
-  description = "Only OpenVPN UDP. DNS, Pi-hole admin, SSH, and metadata are not public."
+  description = "OpenVPN UDP and TCP fallback only. DNS, Pi-hole admin, SSH, and metadata are not public."
   dynamic "ingress" {
     for_each = var.ingress_cidrs
     content {
@@ -39,6 +39,16 @@ resource "aws_security_group" "vpn" {
       protocol    = "udp"
       from_port   = 1194
       to_port     = 1194
+      cidr_blocks = [ingress.value]
+    }
+  }
+  dynamic "ingress" {
+    for_each = var.ingress_cidrs
+    content {
+      description = "OpenVPN TCP fallback with TLS control-channel encryption"
+      protocol    = "tcp"
+      from_port   = 443
+      to_port     = 443
       cidr_blocks = [ingress.value]
     }
   }
@@ -150,4 +160,5 @@ output "gateway" {
 output "subnet_id" { value = aws_subnet.public.id }
 output "vpc_id" { value = aws_vpc.vpn.id }
 output "availability_zone" { value = aws_subnet.public.availability_zone }
+output "public_route_table_id" { value = aws_route_table.public.id }
 output "ami" { value = nonsensitive(data.aws_ssm_parameter.ubuntu.value) }

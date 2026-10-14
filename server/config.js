@@ -1,14 +1,18 @@
 import { readFileSync } from "node:fs";
 export function loadConfig(env = process.env) {
-  const runtime = env.RUNTIME_CONFIG
-    ? JSON.parse(readFileSync(env.RUNTIME_CONFIG, "utf8"))
-    : {};
+  const runtime = env.RUNTIME_CONFIG_JSON
+    ? JSON.parse(env.RUNTIME_CONFIG_JSON)
+    : env.RUNTIME_CONFIG
+      ? JSON.parse(readFileSync(env.RUNTIME_CONFIG, "utf8"))
+      : {};
   const config = {
     production: env.NODE_ENV === "production",
     origin: env.APP_ORIGIN || runtime.origin || "http://localhost:5173",
     authMode: env.AUTH_MODE || runtime.authMode || "local",
     provisioner: env.PROVISIONER || runtime.provisioner || "disabled",
     dataDir: env.DATA_DIR || "./data",
+    databaseTable: env.DATABASE_TABLE || runtime.databaseTable,
+    awsRegion: env.AWS_REGION || runtime.awsRegion || "us-east-1",
     cognito: runtime.cognito,
     artifactBucket: runtime.artifactBucket,
     artifactRegion: runtime.artifactRegion || "us-east-1",
@@ -43,9 +47,9 @@ export function loadConfig(env = process.env) {
     throw new Error("Invalid auth or provisioner mode");
   if (
     config.production &&
-    (config.authMode !== "cognito" || !config.origin.startsWith("https://"))
+    (config.authMode !== "cognito" || !config.origin.startsWith("https://") || !config.databaseTable)
   )
-    throw new Error("Production requires Cognito and an HTTPS origin");
+    throw new Error("Production requires Cognito, HTTPS, and shared DynamoDB storage");
   if (config.authMode === "cognito" && !config.cognito)
     throw new Error("Missing Cognito configuration");
   if (

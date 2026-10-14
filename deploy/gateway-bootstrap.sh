@@ -58,6 +58,14 @@ group nogroup
 management /run/openvpn-server/navalnyvpn.sock unix
 verb 1
 CONF
+sed \
+  -e 's/^port 1194$/port 443/' \
+  -e 's/^proto udp$/proto tcp-server/' \
+  -e 's/^dev tun0$/dev tun1/' \
+  -e 's/^server 10\.8\.0\.0 255\.255\.255\.0$/server 10.9.0.0 255.255.255.0/' \
+  -e 's#^server-ipv6 fd42:6e76:1::/64$#server-ipv6 fd42:6e76:2::/64#' \
+  -e 's#^management /run/openvpn-server/navalnyvpn.sock unix$#management /run/openvpn-server/navalnyvpn-obfuscated.sock unix#' \
+  /etc/openvpn/server/server.conf > /etc/openvpn/server/obfuscated.conf
 cat > /etc/sysctl.d/90-navalnyvpn.conf <<'CONF'
 net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=0
@@ -65,10 +73,12 @@ CONF
 sysctl --system
 systemctl enable --now openvpn-server@server
 systemctl restart openvpn-server@server
+systemctl enable --now openvpn-server@obfuscated
+systemctl restart openvpn-server@obfuscated
 cat > /etc/systemd/system/navalnyvpn-firewall.service <<'UNIT'
 [Unit]
 Description=NavalnyVPN routing and network isolation
-After=network-online.target docker.service openvpn-server@server.service
+After=network-online.target docker.service openvpn-server@server.service openvpn-server@obfuscated.service
 Wants=network-online.target
 [Service]
 Type=oneshot

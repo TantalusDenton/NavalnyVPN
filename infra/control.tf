@@ -1,28 +1,3 @@
-resource "aws_iam_role" "control" {
-  name = "${var.project}-control"
-  assume_role_policy = jsonencode({
-    Version   = "2012-10-17"
-    Statement = [{ Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" }, Action = "sts:AssumeRole" }]
-  })
-}
-resource "aws_iam_role_policy_attachment" "control_ssm" {
-  role       = aws_iam_role.control.name
-  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
-}
-resource "aws_iam_role_policy" "control" {
-  role = aws_iam_role.control.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      { Sid = "GatewayOperations", Effect = "Allow", Action = ["ssm:SendCommand"], Resource = concat([for g in local.gateways : g.instanceArn], [for g in local.gateways : g.documentArn]) },
-      # GetCommandInvocation has no resource-level authorization in AWS.
-      { Sid = "ReadCommandStatus", Effect = "Allow", Action = ["ssm:GetCommandInvocation"], Resource = "*" },
-      { Sid = "RetrieveProfiles", Effect = "Allow", Action = ["s3:GetObject", "s3:DeleteObject"], Resource = "${aws_s3_bucket.artifacts.arn}/profiles/*" },
-      { Sid = "ReadRelease", Effect = "Allow", Action = ["s3:GetObject"], Resource = aws_s3_object.app.arn }
-    ]
-  })
-}
-resource "aws_iam_instance_profile" "control" { role = aws_iam_role.control.name }
 resource "aws_security_group" "control" {
   name_prefix = "${var.project}-portal-"
   vpc_id      = module.virginia.vpc_id
@@ -45,6 +20,21 @@ resource "aws_security_group" "control" {
     to_port     = 0
     cidr_blocks = ["0.0.0.0/0"]
   }
+}
+resource "aws_iam_role" "proxy" {
+  name = "${var.project}-proxy"
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" }, Action = "sts:AssumeRole" }]
+  })
+}
+resource "aws_iam_role_policy_attachment" "proxy_ssm" {
+  role       = aws_iam_role.proxy.name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+resource "aws_iam_instance_profile" "proxy" {
+  name = "${var.project}-proxy"
+  role = aws_iam_role.proxy.name
 }
 resource "aws_eip" "control" { domain = "vpc" }
 resource "aws_ebs_volume" "control_data" {
@@ -72,7 +62,7 @@ resource "aws_instance" "control" {
   instance_type               = var.control_instance_type
   subnet_id                   = module.virginia.subnet_id
   vpc_security_group_ids      = [aws_security_group.control.id]
-  iam_instance_profile        = aws_iam_instance_profile.control.name
+  iam_instance_profile        = aws_iam_instance_profile.proxy.name
   user_data_replace_on_change = true
   metadata_options {
     http_endpoint               = "enabled"
@@ -89,18 +79,16 @@ resource "aws_instance" "control" {
   user_data_base64 = base64gzip("#cloud-config\n${yamlencode({
     write_files = [
       { path = "/etc/navalnyvpn/node.json", permissions = "0600", content = jsonencode({
-        volumeId       = aws_ebs_volume.control_data.id, artifactBucket = aws_s3_bucket.artifacts.id
-        artifactRegion = "us-east-1", archiveKey = aws_s3_object.app.key
+        volumeId = aws_ebs_volume.control_data.id
       }) },
-      { path = "/etc/navalnyvpn/runtime.json", permissions = "0644", content = jsonencode(local.runtime) },
       { path = "/usr/local/sbin/navalny-mount-data", permissions = "0700", content = file("${path.module}/../deploy/mount-data.sh") },
       { path = "/usr/local/sbin/navalny-bootstrap", permissions = "0700", content = file("${path.module}/../deploy/control-bootstrap.sh") },
-      { path = "/etc/navalnyvpn/Caddyfile", permissions = "0644", content = "${var.domain} {\n  encode zstd gzip\n  reverse_proxy 127.0.0.1:3001\n  header Strict-Transport-Security \"max-age=31536000; includeSubDomains\"\n}\n" }
+      { path = "/etc/navalnyvpn/Caddyfile", permissions = "0644", content = "${var.domain} {\n  encode zstd gzip\n  reverse_proxy ${aws_lb.portal.dns_name}:80\n  header Strict-Transport-Security \"max-age=31536000; includeSubDomains\"\n}\n" }
     ]
     runcmd = [["bash", "/usr/local/sbin/navalny-bootstrap"]]
   })}")
   tags       = { Name = "${var.project}-portal" }
-  depends_on = [aws_iam_role_policy.control, aws_iam_role_policy_attachment.control_ssm, aws_cognito_managed_login_branding.web]
+  depends_on = [aws_cognito_managed_login_branding.web, aws_iam_role_policy_attachment.proxy_ssm]
 }
 resource "aws_volume_attachment" "control_data" {
   device_name = "/dev/sdf"

@@ -31,13 +31,27 @@ const publicProfile = (p) => ({
   downloaded: Boolean(p.downloaded),
   error: p.error,
 });
+class PersistentRateLimitStore {
+  constructor(db, prefix) {
+    this.db = db;
+    this.prefix = prefix;
+  }
+  init(options) {
+    this.windowMs = options.windowMs;
+  }
+  increment(key) {
+    return this.db.incrementRateLimit(`${this.prefix}:${key}`, this.windowMs, Date.now());
+  }
+  decrement() {}
+  resetKey() {}
+}
 export function createApp(
   config,
   db,
   provisioner = config.provisioner === "aws" ? awsProvisioner(config) : null,
 ) {
   const app = express();
-  if (config.production) app.set("trust proxy", "loopback");
+  if (config.production) app.set("trust proxy", "loopback, linklocal, uniquelocal");
   app.use(
     helmet({
       contentSecurityPolicy: {
@@ -76,6 +90,7 @@ export function createApp(
   app.use(
     "/api",
     rateLimit({
+      store: new PersistentRateLimitStore(db, "api"),
       windowMs: 60_000,
       limit: 120,
       standardHeaders: "draft-8",
@@ -84,6 +99,7 @@ export function createApp(
     }),
   );
   const authLimit = rateLimit({
+    store: new PersistentRateLimitStore(db, "auth"),
     windowMs: 900_000,
     limit: 20,
     standardHeaders: "draft-8",
@@ -101,23 +117,19 @@ export function createApp(
   const cookieName = config.production
     ? "__Host-navalny_session"
     : "navalny_session";
-  function session(res, user) {
+  async function session(res, user) {
     const value = token();
-    db.prepare("INSERT INTO sessions VALUES (?, ?, ?)").run(
+    await db.createSession(
       digest(value),
       user.id,
       Date.now() + 3600_000,
     );
     res.cookie(cookieName, value, { ...cookieOptions, maxAge: 3600_000 });
   }
-  app.use((req, res, next) => {
+  app.use(async (req, res, next) => {
     const value = req.cookies[cookieName];
     if (value)
-      req.user = db
-        .prepare(
-          "SELECT users.* FROM users JOIN sessions ON users.id=sessions.user_id WHERE sessions.hash=? AND sessions.expires>?",
-        )
-        .get(digest(value), Date.now());
+      req.user = await db.getUserBySessionHash(digest(value), Date.now());
     next();
   });
   const requireUser = (req, res, next) =>
@@ -163,7 +175,7 @@ export function createApp(
           error: "Enter a valid email and a password of 12–128 characters.",
         });
     const { email, password } = parsed.data;
-    let user = db.prepare("SELECT * FROM users WHERE email=?").get(email);
+    let user = await db.getUserByEmail(email);
     if (action === "register") {
       if (user)
         return res
@@ -171,32 +183,22 @@ export function createApp(
           .json({ error: "Unable to create this account. Try signing in." });
       const encoded = await hashPassword(password);
       user = { id: randomUUID(), email, created: new Date().toISOString() };
-      try {
-        db.prepare("INSERT INTO users VALUES (?, ?, ?, ?)").run(
-          user.id,
-          email,
-          encoded,
-          user.created,
-        );
-      } catch (error) {
-        if (error.code?.startsWith("ERR_SQLITE"))
-          return res
-            .status(409)
-            .json({ error: "Unable to create this account. Try signing in." });
-        throw error;
-      }
+      if (!(await db.createLocalUser(user, encoded)))
+        return res
+          .status(409)
+          .json({ error: "Unable to create this account. Try signing in." });
     } else if (
       !user?.password ||
       !(await checkPassword(password, user.password))
     ) {
       return res.status(401).json({ error: "Email or password is incorrect." });
     }
-    session(res, user);
+    await session(res, user);
     res.json({ user: publicUser(user) });
   });
-  app.post("/api/logout", (req, res) => {
+  app.post("/api/logout", async (req, res) => {
     if (req.cookies[cookieName])
-      db.prepare("DELETE FROM sessions WHERE hash=?").run(
+      await db.deleteSession(
         digest(req.cookies[cookieName]),
       );
     res.clearCookie(cookieName, cookieOptions);
@@ -214,17 +216,14 @@ export function createApp(
       tokenUse: "id",
       clientId: config.cognito.clientId,
     });
-    app.get("/auth/login", (req, res) => {
+    app.get("/auth/login", async (req, res) => {
       const state = token(),
         codeVerifier = token(),
         nonce = token();
-      db.prepare("DELETE FROM oauth WHERE expires<?").run(Date.now());
-      db.prepare("INSERT INTO oauth VALUES (?, ?, ?, ?)").run(
-        digest(state),
-        codeVerifier,
-        nonce,
-        Date.now() + 600_000,
-      );
+      await db.putOAuth({
+        hash: digest(state), verifier: codeVerifier, nonce,
+        expires: Date.now() + 600_000,
+      });
       res.cookie("__Host-navalny_oauth", state, {
         ...cookieOptions,
         maxAge: 600_000,
@@ -252,9 +251,7 @@ export function createApp(
         return res
           .status(400)
           .send("Invalid sign-in state. Please try signing in again.");
-      const state = db
-        .prepare("DELETE FROM oauth WHERE hash=? AND expires>? RETURNING *")
-        .get(digest(req.query.state), Date.now());
+      const state = await db.consumeOAuth(digest(req.query.state), Date.now());
       res.clearCookie("__Host-navalny_oauth", cookieOptions);
       if (!state)
         return res.status(400).send("Sign-in expired. Please try again.");
@@ -283,10 +280,8 @@ export function createApp(
         email: claims.email.toLowerCase(),
         created: new Date().toISOString(),
       };
-      db.prepare(
-        "INSERT INTO users VALUES (?, ?, NULL, ?) ON CONFLICT(id) DO UPDATE SET email=excluded.email",
-      ).run(user.id, user.email, user.created);
-      session(res, user);
+      await db.upsertCognitoUser(user);
+      await session(res, user);
       res.redirect("/");
     });
   }
@@ -313,15 +308,11 @@ export function createApp(
           ? "Revocation failed. Retry to invalidate this certificate."
           : "Gateway provisioning failed. Revoke this profile before creating another."
         : null;
-    db.prepare(
-      "UPDATE profiles SET status=?, error=? WHERE id=? AND command_id=?",
-    ).run(status, error, profile.id, profile.command_id);
-    return db.prepare("SELECT * FROM profiles WHERE id=?").get(profile.id);
+    await db.refreshProfileStatus(profile.id, profile.command_id, status, error);
+    return db.getProfile(profile.id);
   }
   app.get("/api/profiles", requireUser, async (req, res) => {
-    const profiles = db
-      .prepare("SELECT * FROM profiles WHERE user_id=? ORDER BY created DESC")
-      .all(req.user.id);
+    const profiles = await db.listProfiles(req.user.id);
     res.json({
       profiles: (await Promise.all(profiles.map(refresh))).map(publicProfile),
     });
@@ -335,11 +326,7 @@ export function createApp(
       return res
         .status(400)
         .json({ error: "Choose a valid device name and region." });
-    const count = db
-      .prepare(
-        "SELECT COUNT(*) AS n FROM profiles WHERE user_id=? AND status NOT IN ('revoked')",
-      )
-      .get(req.user.id).n;
+    const count = await db.countActiveProfiles(req.user.id);
     if (count >= 5)
       return res
         .status(409)
@@ -354,40 +341,33 @@ export function createApp(
       status: provisioner ? "issuing" : "draft",
       created: new Date().toISOString(),
     };
-    db.prepare(
-      "INSERT INTO profiles (id,user_id,name,region,status,created) VALUES (?,?,?,?,?,?)",
-    ).run(p.id, p.user_id, p.name, p.region, p.status, p.created);
+    await db.createProfile(p);
     try {
       if (provisioner)
-        db.prepare("UPDATE profiles SET command_id=? WHERE id=?").run(
-          await provisioner.start("issue", p),
-          p.id,
-        );
+        await db.updateProfile(p.id, {
+          command_id: await provisioner.start("issue", p),
+        });
     } catch (error) {
-      db.prepare("UPDATE profiles SET status='failed', error=? WHERE id=?").run(
-        "Could not reach the gateway. Revoke this profile and try again.",
-        p.id,
-      );
+      await db.updateProfile(p.id, {
+        status: "failed",
+        error: "Could not reach the gateway. Revoke this profile and try again.",
+      });
       throw error;
     }
     res
       .status(201)
       .json({
         profile: publicProfile(
-          db.prepare("SELECT * FROM profiles WHERE id=?").get(p.id),
+          await db.getProfile(p.id),
         ),
       });
   });
-  const owned = (req, res, next) => {
-    req.profile = db
-      .prepare("SELECT * FROM profiles WHERE id=? AND user_id=?")
-      .get(req.params.id, req.user.id);
+  const owned = async (req, res, next) => {
+    req.profile = await db.getOwnedProfile(req.params.id, req.user.id);
     return req.profile
       ? next()
       : res.status(404).json({ error: "Profile not found." });
   };
-  // A per-profile lock prevents concurrent requests downloading the same private key.
-  const downloading = new Set();
   app.post(
     "/api/profiles/:id/download",
     requireUser,
@@ -402,15 +382,17 @@ export function createApp(
               ? "This profile has already been downloaded. Create a new profile if you need another copy."
               : "A deployed, ready gateway is required before downloading a profile.",
           });
-      if (downloading.has(p.id))
+      const downloadToken = randomUUID();
+      const now = Date.now();
+      if (!(await db.claimProfileDownload(p.id, downloadToken, now, now + 120_000)))
         return res
           .status(409)
           .json({ error: "A download is already in progress." });
-      downloading.add(p.id);
       try {
         const bytes = await provisioner.download(p);
         await provisioner.removeArtifact(p);
-        db.prepare("UPDATE profiles SET downloaded=1 WHERE id=?").run(p.id);
+        if (!(await db.completeProfileDownload(p.id, downloadToken)))
+          throw new Error("Could not finalize the profile download");
         res.set({
           "Content-Type": "application/x-openvpn-profile",
           "Content-Disposition": `attachment; filename="navalnyvpn-${p.region}-${p.id.slice(-8)}.ovpn"`,
@@ -428,7 +410,7 @@ export function createApp(
             });
         throw error;
       } finally {
-        downloading.delete(p.id);
+        await db.releaseProfileDownload(p.id, downloadToken);
       }
     },
   );
@@ -442,14 +424,12 @@ export function createApp(
         });
     if (p.status === "revoked") return res.json({ ok: true });
     if (!provisioner || p.status === "draft")
-      db.prepare(
-        "UPDATE profiles SET status='revoked',error=NULL WHERE id=?",
-      ).run(p.id);
+      await db.updateProfile(p.id, { status: "revoked", error: null });
     else {
       const command = await provisioner.start("revoke", p);
-      db.prepare(
-        "UPDATE profiles SET status='revoking',command_id=?,error=NULL WHERE id=?",
-      ).run(command, p.id);
+      await db.updateProfile(p.id, {
+        status: "revoking", command_id: command, error: null,
+      });
       await provisioner.removeArtifact(p);
     }
     res.json({ ok: true });

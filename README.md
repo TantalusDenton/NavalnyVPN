@@ -18,20 +18,20 @@ Open **http://localhost:5173**. Create a local account using an email and a pass
 ```sh
 npm test
 npm run build
-npm run package
 ```
 
-The deployment archive at `build/navalnyvpn.tar.gz` contains source and the dependency lockfile. The AWS host builds the container from it. Local accounts, environment files, Terraform state, and private keys are excluded.
+Local accounts, environment files, Terraform state, and private keys are excluded.
 
 ## Implemented
 
 - Responsive dashboard, account page, profile manager, region selection, connection guide, and `!` branding.
 - Local authentication with scrypt hashes and server-side sessions. Production Cognito managed login with verified email, recovery, optional TOTP support, authorization code + PKCE, state, nonce, and HttpOnly cookies. Browser code never receives Cognito tokens.
 - Five current profiles per account. Individual 365-day EC device certificates, asynchronous issuance, single-use `.ovpn` downloads, retryable revocation, CRL updates, and immediate session termination on revocation.
-- OpenVPN Community Edition over UDP/1194, AEAD ciphers, TLS 1.2 minimum, verified server certificates, and inline client credentials.
+- OpenVPN Community Edition over UDP/1194 with a TCP/443 fallback, AEAD ciphers, TLS 1.2 minimum, verified server certificates, and inline client credentials. Both transports use `tls-crypt` to encrypt and authenticate OpenVPN control-channel packets.
 - Pi-hole v6 on every gateway. Ad/tracker and adult-domain lists, eight-hour gravity refresh, redirected standard DNS, blocked DNS-over-TLS, and disabled DNS query history.
 - Independent gateways in Virginia (`us-east-1`), Frankfurt (`eu-central-1`), and Singapore (`ap-southeast-1`). A Virginia-only deployment is also supported.
-- Encrypted EBS volumes for account data and regional PKI, protected against accidental Terraform destruction. No public SSH, DNS resolver, or Pi-hole admin port.
+- ECS Fargate portal/API tasks behind an internal ALB, starting at two tasks and scaling from CPU or memory up to a configurable maximum. Shared sessions, OAuth state, accounts, and profiles are stored in encrypted, point-in-time-recoverable DynamoDB.
+- Encrypted EBS volumes for regional PKI, protected against accidental Terraform destruction. No public SSH, DNS resolver, or Pi-hole admin port.
 
 ## AWS deployment
 
@@ -39,7 +39,6 @@ Read [the deployment guide](docs/deployment.md) for activation, validation, back
 
 ```sh
 npm ci
-npm run package
 cd infra
 terraform init
 terraform validate
@@ -48,13 +47,15 @@ terraform plan -out=navalnyvpn.tfplan
 terraform apply navalnyvpn.tfplan
 ```
 
+The portal image is built and pushed to the Terraform-created ECR repository. Deploy in two stages: first apply with `portal_service_enabled = false`, push the configured immutable image tag, then reapply with `portal_service_enabled = true`. The guide includes commands. Fargate is for the horizontally scaled web/API control plane; OpenVPN gateways remain on EC2 because they require TUN devices and host routing.
+
 The Terraform creates no domain registration, hosted zone, or DNS record. Domain activation is a later manual step. Caddy obtains HTTPS certificates once the operator points the intended hostname to the portal IP.
 
-The service is **free for users**, not free to operate. AWS instances, public IPs, disks, snapshots, Cognito, S3, and outbound bandwidth incur charges. There is no subscription or payment flow.
+The service is **free for users**, not free to operate. AWS Fargate tasks, the load balancer, EC2 gateways/proxy, public IPs, disks, snapshots, Cognito, DynamoDB, S3, and outbound bandwidth incur charges. There is no subscription or payment flow.
 
 ## Practical limits
 
-This is a deployment baseline, not an audited anonymity service. The portal uses one control host and SQLite. Each region has one gateway. There is no automatic failover, autoscaling, traffic obfuscation, native VPN client, or audited no-logs guarantee.
+This is a deployment baseline, not an audited anonymity service. The portal API autoscaling does not autoscale VPN gateway capacity; each region still has one gateway and is a single point of failure. TCP/443 plus `tls-crypt` makes OpenVPN control-channel traffic harder to identify and provides a fallback where UDP is blocked, but it does not impersonate HTTPS and cannot guarantee censorship evasion. There is no native VPN client or audited no-logs guarantee.
 
 Pi-hole filters domain names. It cannot block every in-app ad, inspect encrypted pages, or guarantee adult-content blocking. DNS-over-HTTPS can bypass filtering. A compatible OpenVPN router can extend coverage to a home network; devices outside its tunnel are unaffected.
 
@@ -65,8 +66,8 @@ This IPv4 baseline routes IPv6 into the tunnel and blocks it server-side. Enable
 | Path | Purpose |
 |---|---|
 | `web/` | React dashboard, responsive styles, locally served fonts |
-| `server/` | Express, authentication, SQLite, SSM/S3 provisioning |
-| `infra/` | Terraform, gateway module, credential-free plan tests |
+| `server/` | Express, authentication, SQLite for local use, DynamoDB for AWS, SSM/S3 provisioning |
+| `infra/` | Terraform, Fargate portal autoscaling, regional VPN gateways, credential-free plan tests |
 | `deploy/` | Bootstrap, firewall, certificate and revocation scripts |
 | `test/` | API/security tests and real OpenVPN tunnel fixture |
 | `docs/deployment.md` | Deployment and operations |

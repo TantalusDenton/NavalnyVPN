@@ -39,11 +39,3 @@ resource "aws_s3_bucket_lifecycle_configuration" "profiles" {
     abort_incomplete_multipart_upload { days_after_initiation = 1 }
   }
 }
-resource "aws_s3_object" "app" {
-  bucket                 = aws_s3_bucket.artifacts.id
-  key                    = "releases/${filesha256(var.app_archive)}.tar.gz"
-  source                 = var.app_archive
-  source_hash            = filesha256(var.app_archive)
-  server_side_encryption = "AES256"
-  depends_on             = [aws_s3_bucket_policy.tls, aws_s3_bucket_server_side_encryption_configuration.artifacts]
-}

@@ -4,7 +4,7 @@ mock_provider "aws" {
     defaults = { account_id = "123456789012" }
   }
   mock_data "aws_availability_zones" {
-    defaults = { names = ["us-east-1a"] }
+    defaults = { names = ["us-east-1a", "us-east-1b"] }
   }
   mock_data "aws_ssm_parameter" {
     defaults = { value = "ami-0123456789abcdef0" }
@@ -45,6 +45,30 @@ run "three_region_plan" {
   assert {
     condition     = alltrue([for rule in aws_security_group.control.ingress : contains([80, 443], rule.from_port)])
     error_message = "Only HTTP validation and HTTPS may be public on the portal."
+  }
+  assert {
+    condition     = aws_dynamodb_table.portal.billing_mode == "PAY_PER_REQUEST" && aws_dynamodb_table.portal.point_in_time_recovery[0].enabled
+    error_message = "The horizontally scaled portal must use protected shared DynamoDB state."
+  }
+  assert {
+    condition     = toset(["FARGATE"]) == aws_ecs_task_definition.portal.requires_compatibilities && aws_ecs_task_definition.portal.network_mode == "awsvpc"
+    error_message = "The portal service must use Fargate awsvpc networking."
+  }
+  assert {
+    condition     = length(aws_subnet.portal) == 2
+    error_message = "The portal service must use two Availability Zones."
+  }
+}
+run "autoscaled_fargate_service" {
+  command = plan
+  variables { portal_service_enabled = true }
+  assert {
+    condition     = aws_ecs_service.portal[0].desired_count == 2 && aws_appautoscaling_target.portal[0].max_capacity == 8
+    error_message = "The portal should start with two tasks and support scale-out to eight."
+  }
+  assert {
+    condition     = aws_appautoscaling_policy.portal_cpu[0].target_tracking_scaling_policy_configuration[0].target_value == 55
+    error_message = "Portal Fargate tasks must scale on average CPU load."
   }
 }
 run "single_region_plan" {

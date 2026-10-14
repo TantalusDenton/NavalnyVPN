@@ -43,10 +43,55 @@ variable "control_instance_type" {
     error_message = "This baseline supports t3 x86_64 instances."
   }
 }
-variable "app_archive" {
-  description = "Built by npm run package, relative to the Terraform working directory."
+variable "app_image_tag" {
+  description = "Immutable ECR image tag built and pushed by the operator."
   type        = string
-  default     = "../build/navalnyvpn.tar.gz"
+  default     = "v1"
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$", var.app_image_tag))
+    error_message = "Use a valid immutable container image tag."
+  }
+}
+variable "portal_service_enabled" {
+  description = "Enable after creating the ECR repository and pushing app_image_tag."
+  type        = bool
+  default     = false
+}
+variable "portal_min_tasks" {
+  description = "Minimum portal Fargate task count; at least two tasks are required for redundancy."
+  type        = number
+  default     = 2
+  validation {
+    condition     = var.portal_min_tasks >= 2 && var.portal_min_tasks <= 20
+    error_message = "portal_min_tasks must be between 2 and 20."
+  }
+}
+variable "portal_max_tasks" {
+  description = "Maximum portal Fargate task count for target-tracking autoscaling."
+  type        = number
+  default     = 8
+  validation {
+    condition     = var.portal_max_tasks >= var.portal_min_tasks && var.portal_max_tasks <= 100
+    error_message = "portal_max_tasks must be at least portal_min_tasks and no more than 100."
+  }
+}
+variable "portal_cpu_target" {
+  type        = number
+  default     = 55
+  description = "Target average ECS service CPU utilization percentage."
+  validation {
+    condition     = var.portal_cpu_target >= 20 && var.portal_cpu_target <= 90
+    error_message = "Set a CPU target from 20 through 90 percent."
+  }
+}
+variable "portal_memory_target" {
+  type        = number
+  default     = 70
+  description = "Target average ECS service memory utilization percentage."
+  validation {
+    condition     = var.portal_memory_target >= 20 && var.portal_memory_target <= 90
+    error_message = "Set a memory target from 20 through 90 percent."
+  }
 }
 variable "pihole_image" {
   type        = string
@@ -56,7 +101,7 @@ variable "pihole_image" {
 variable "vpn_ingress_cidrs" {
   type        = set(string)
   default     = ["0.0.0.0/0"]
-  description = "Clients allowed to connect to UDP/1194."
+  description = "Clients allowed to connect to OpenVPN UDP/1194 and TCP/443 fallback."
   validation {
     condition     = length(var.vpn_ingress_cidrs) > 0 && alltrue([for c in var.vpn_ingress_cidrs : can(cidrnetmask(c))])
     error_message = "Supply at least one valid IPv4 CIDR."

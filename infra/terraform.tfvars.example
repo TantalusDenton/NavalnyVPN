@@ -3,5 +3,8 @@ domain        = "navalnyvpn.net"
 enabled_regions = ["us-east-1", "eu-central-1", "ap-southeast-1"]
 gateway_instance_type = "t3.small"
 control_instance_type = "t3.small"
+app_image_tag         = "v1"
+# Set true only after the tagged image has been pushed to the ECR repository.
+portal_service_enabled = false
 # For a smaller initial deployment, enable only ["us-east-1"].
 # No Route 53 hosted zone, DNS record, or registration is created.

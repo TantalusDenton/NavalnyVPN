@@ -67,7 +67,7 @@ test("accounts hash passwords, persist sessions, reject invalid input and sign o
   assert.equal(account.status, 200);
   assert.match(account.headers.get("set-cookie"), /HttpOnly/);
   assert.match(account.headers.get("set-cookie"), /SameSite=Lax/);
-  const stored = db.prepare("SELECT * FROM users").get();
+  const stored = await db.getUserByEmail("alice@example.com");
   assert.notEqual(stored.password, "test-only-password-123");
   assert.ok(!JSON.stringify(account.body).includes(stored.password));
   assert.equal(
@@ -119,6 +119,15 @@ test("CSRF guard rejects cross-origin writes and anonymous profile access", asyn
     (await request("/config")).headers.get("cache-control"),
     "no-store",
   );
+});
+test("shared rate-limit storage counts requests in fixed windows", async (t) => {
+  const { db } = await fixture(t);
+  const start = 1_800_000_000_000;
+  const first = await db.incrementRateLimit("api:client-a", 60_000, start);
+  const second = await db.incrementRateLimit("api:client-a", 60_000, start + 1);
+  const nextWindow = await db.incrementRateLimit("api:client-a", 60_000, start + 60_000);
+  const otherClient = await db.incrementRateLimit("api:client-b", 60_000, start);
+  assert.deepEqual([first.totalHits, second.totalHits, nextWindow.totalHits, otherClient.totalHits], [1, 2, 1, 1]);
 });
 test("profile ownership, region validation, limits, disabled downloads and draft revocation", async (t) => {
   const { request, register } = await fixture(t);
@@ -242,6 +251,37 @@ test("AWS profile state transitions, single download, failed revocation and safe
     (await request("/profiles", { cookie })).body.profiles[0].status,
     "revoked",
   );
+});
+test("concurrent profile downloads are serialized across API requests", async (t) => {
+  let beginDownload;
+  let finishDownload;
+  const started = new Promise((resolve) => { beginDownload = resolve; });
+  const blocked = new Promise((resolve) => { finishDownload = resolve; });
+  let downloadCount = 0;
+  const provisioner = {
+    start: async () => "issue-command",
+    status: async () => "success",
+    download: async () => {
+      downloadCount++;
+      beginDownload();
+      await blocked;
+      return Buffer.from("profile fixture");
+    },
+    removeArtifact: async () => {},
+  };
+  const { request, register } = await fixture(t, provisioner);
+  const cookie = (await register("single-use@example.com")).cookie;
+  const created = await request("/profiles", {
+    method: "POST", cookie, body: { name: "Laptop", region: "eu-central-1" },
+  });
+  const id = created.body.profile.id;
+  const first = request(`/profiles/${id}/download`, { method: "POST", cookie });
+  await started;
+  const second = await request(`/profiles/${id}/download`, { method: "POST", cookie });
+  assert.equal(second.status, 409);
+  finishDownload();
+  assert.equal((await first).status, 200);
+  assert.equal(downloadCount, 1);
 });
 test("download expiration does not return fake profile data", async (t) => {
   const provisioner = {

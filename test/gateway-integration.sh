@@ -14,6 +14,14 @@ install -m 600 pki/private/server.key /etc/openvpn/server/server.key
 install -m 644 pki/crl.pem /etc/openvpn/server/crl.pem
 openvpn --genkey secret /etc/openvpn/server/tls-crypt.key
 awk '/^cat > \/etc\/openvpn\/server\/server.conf/{copy=1;next} copy && /^CONF$/{exit} copy{print}' /workspace/deploy/gateway-bootstrap.sh > /etc/openvpn/server/server.conf
+sed \
+  -e 's/^port 1194$/port 443/' \
+  -e 's/^proto udp$/proto tcp-server/' \
+  -e 's/^dev tun0$/dev tun1/' \
+  -e 's/^server 10\.8\.0\.0 255\.255\.255\.0$/server 10.9.0.0 255.255.255.0/' \
+  -e 's#^server-ipv6 fd42:6e76:1::/64$#server-ipv6 fd42:6e76:2::/64#' \
+  -e 's#^management /run/openvpn-server/navalnyvpn.sock unix$#management /run/openvpn-server/navalnyvpn-obfuscated.sock unix#' \
+  /etc/openvpn/server/server.conf > /etc/openvpn/server/obfuscated.conf
 printf '%s\n' '{"artifactBucket":"test-bucket","artifactRegion":"us-east-1","region":"eu-central-1","publicIp":"127.0.0.1"}' > /etc/navalnyvpn/node.json
 install -m 700 /workspace/deploy/profile.sh /usr/local/sbin/navalny-profile
 # Only cloud transport, systemd, and DNS readiness are mocked. PKI and the tunnel use real tools.
@@ -30,7 +38,8 @@ MOCK
 chmod 755 /tmp/mock-bin/*
 export PATH="/tmp/mock-bin:$PATH"
 openvpn --config /etc/openvpn/server/server.conf --writepid /tmp/server.pid --daemon --log /tmp/server.log
-for i in $(seq 1 30); do [ -S /run/openvpn-server/navalnyvpn.sock ] && break; sleep 1; done
+openvpn --config /etc/openvpn/server/obfuscated.conf --writepid /tmp/obfuscated.pid --daemon --log /tmp/obfuscated.log
+for i in $(seq 1 30); do [ -S /run/openvpn-server/navalnyvpn.sock ] && [ -S /run/openvpn-server/navalnyvpn-obfuscated.sock ] && break; sleep 1; done
 id=nv-12345678-1234-1234-1234-123456789abc
 /usr/local/sbin/navalny-profile issue "$id" > /tmp/issue-output
 grep -qx issued /tmp/issue-output
@@ -44,20 +53,38 @@ for tag in ("ca","cert","key"):
     open("/tmp/"+tag+".pem","w").write(text)
 assert "remote-cert-tls server" in profile
 assert "verify-x509-name server name" in profile
+assert "remote 127.0.0.1 1194 udp" in profile
+assert "remote 127.0.0.1 443 tcp" in profile
 assert "<tls-crypt>" in profile
 PY
 openssl verify -CAfile /tmp/ca.pem -purpose sslclient /tmp/cert.pem
 openssl x509 -in /tmp/cert.pem -pubkey -noout > /tmp/cert.pub
 openssl pkey -in /tmp/key.pem -pubout > /tmp/key.pub
 cmp /tmp/cert.pub /tmp/key.pub
-openvpn --config /tmp/delivery/profile.ovpn --dev tun1 --route-nopull --writepid /tmp/client.pid --daemon --log /tmp/client.log --verb 3
+openvpn --config /tmp/delivery/profile.ovpn --dev tun2 --route-nopull --daemon --log /tmp/client-udp.log --verb 3
 connected=false
 for i in $(seq 1 40); do
-  if grep -q 'Initialization Sequence Completed' /tmp/client.log; then connected=true; break; fi
+  if grep -q 'Initialization Sequence Completed' /tmp/client-udp.log; then connected=true; break; fi
   sleep 1
 done
-if [ "$connected" != true ]; then cat /tmp/server.log /tmp/client.log; exit 1; fi
-echo "PASS: signed inline profile establishes a real OpenVPN tunnel"
+if [ "$connected" != true ]; then cat /tmp/server.log /tmp/obfuscated.log /tmp/client-udp.log; exit 1; fi
+grep -q 'Peer Connection Initiated' /tmp/client-udp.log
+echo "PASS: signed inline profile connects over preferred OpenVPN UDP/1194"
+python3 - <<'PY'
+path = "/tmp/delivery/profile.ovpn"
+profile = open(path).read()
+profile = profile.replace("remote 127.0.0.1 1194 udp", "remote 127.0.0.1 1 udp", 1)
+open(path, "w").write(profile)
+PY
+openvpn --config /tmp/delivery/profile.ovpn --dev tun3 --route-nopull --writepid /tmp/client-tcp.pid --daemon --log /tmp/client-tcp.log --verb 3
+connected=false
+for i in $(seq 1 40); do
+  if grep -q 'Initialization Sequence Completed' /tmp/client-tcp.log; then connected=true; break; fi
+  sleep 1
+done
+if [ "$connected" != true ]; then cat /tmp/obfuscated.log /tmp/client-tcp.log; exit 1; fi
+grep -q 'Peer Connection Initiated' /tmp/client-tcp.log
+echo "PASS: signed inline profile falls back to a real OpenVPN TCP/443 tunnel"
 /usr/local/sbin/navalny-profile revoke "$id" > /tmp/revoke-output
 grep -qx revoked /tmp/revoke-output
 test ! -f /tmp/delivery/profile.ovpn
@@ -65,7 +92,7 @@ python3 - "$id" <<'PY'
 import socket, sys
 s=socket.socket(socket.AF_UNIX)
 s.settimeout(5)
-s.connect('/run/openvpn-server/navalnyvpn.sock')
+s.connect('/run/openvpn-server/navalnyvpn-obfuscated.sock')
 s.recv(4096)
 s.sendall(b'status 3\n')
 data=b''
